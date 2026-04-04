@@ -1,0 +1,92 @@
+#*****************************************************************************
+#                                                                            *
+#   98Modem Win98 VxD - DDK Makefile                                        *
+#                                                                            *
+#   Build from driver\vxd\ with:                                            *
+#     build_vxd.bat [C:\98DDK] [free|checked]                               *
+#                                                                            *
+#*****************************************************************************
+
+BUILD_TYPE=base
+!INCLUDE $(BASEDIR)\inc\master.mk
+
+!ifdef DEBUG
+DDEBUG = -DDEBLEVEL=1 -DDEBUG
+!else
+DDEBUG = -DDEBLEVEL=0
+!endif
+
+DEVICE   = VMODEM
+SRC_VXD  = ..\..\src\vxd
+SRC_COMMON = ..\..\src\common
+INC_DIR  = ..\..\include
+
+CVXDFLAGS = -Zdp -Gs -c -DIS_32 -Zl -W3 $(DDEBUG) -I$(INC32) -I. -I$(INC_DIR)
+AFLAGS    = -coff -DBLD_COFF -DIS_32 -W2 -Zd -c -Cx -DMASM6 $(DDEBUG) -I$(INC32) -I.
+LFLAGS    = -machine:i386 -debug:none -pdb:none -subsystem:native -libpath:$(LIB32)
+
+OBJS = obj\i386\vxd_ctrl.obj \
+       obj\i386\vcomm_glue.obj \
+       obj\i386\dos_uart_glue.obj \
+       obj\i386\modem_core.obj \
+       obj\i386\dos_uart.obj \
+       obj\i386\serial_vxd.obj \
+       obj\i386\ipc_vxd.obj \
+       obj\i386\serial_port.obj \
+       obj\i386\trace.obj
+
+default: obj\i386\$(DEVICE).vxd
+
+obj\i386:
+	-@if not exist obj mkdir obj
+	-@if not exist obj\i386 mkdir obj\i386
+
+obj\i386\vxd_ctrl.obj: obj\i386 vxd_ctrl.asm
+	ml $(AFLAGS) -Fo$@ vxd_ctrl.asm
+
+obj\i386\vcomm_glue.obj: obj\i386 vcomm_glue.asm
+	ml $(AFLAGS) -Fo$@ vcomm_glue.asm
+
+obj\i386\dos_uart_glue.obj: obj\i386 dos_uart_glue.asm
+	ml $(AFLAGS) -Fo$@ dos_uart_glue.asm
+
+obj\i386\modem_core.obj: obj\i386 $(SRC_COMMON)\modem_core.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_COMMON)\modem_core.c
+
+obj\i386\dos_uart.obj: obj\i386 $(SRC_VXD)\dos_uart.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_VXD)\dos_uart.c
+
+obj\i386\serial_vxd.obj: obj\i386 $(SRC_VXD)\serial_vxd.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_VXD)\serial_vxd.c
+
+obj\i386\ipc_vxd.obj: obj\i386 $(SRC_VXD)\ipc_vxd.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_VXD)\ipc_vxd.c
+
+obj\i386\serial_port.obj: obj\i386 $(SRC_VXD)\serial_port.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_VXD)\serial_port.c
+
+obj\i386\trace.obj: obj\i386 $(SRC_VXD)\trace.c
+	cl $(CVXDFLAGS) -Fo$@ $(SRC_VXD)\trace.c
+
+obj\i386\$(DEVICE).vxd: obj\i386 $(OBJS) $(DEVICE).def
+!ifndef PASS0ONLY
+	@echo link -OUT:$@
+	link @<<obj\i386\$(DEVICE).lnk
+$(LFLAGS)
+-ignore:4078 -ignore:4039
+-OUT:obj\i386\$(DEVICE).vxd
+-MAP:obj\i386\$(DEVICE).map
+-DEF:$(DEVICE).def
+-VXD $(BASEDIR)\lib\i386\free\vxdwraps.clb $(OBJS)
+<<
+	mapsym -s -o obj\i386\$(DEVICE).sym obj\i386\$(DEVICE).map
+!endif
+
+clean:
+	-@if exist obj\i386\*.obj del obj\i386\*.obj
+	-@if exist obj\i386\*.vxd del obj\i386\*.vxd
+	-@if exist obj\i386\*.exp del obj\i386\*.exp
+	-@if exist obj\i386\*.lib del obj\i386\*.lib
+	-@if exist obj\i386\*.map del obj\i386\*.map
+	-@if exist obj\i386\*.sym del obj\i386\*.sym
+	-@if exist obj\i386\*.lnk del obj\i386\*.lnk

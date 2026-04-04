@@ -1,0 +1,26 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "win98-host-tdm",
+      "displayName": "Win98 Host Build (TDM-GCC)",
+      "description": "Build Win98 helper applications using TDM-GCC 32-bit MinGW. Requires tdm32 gcc on PATH.",
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/build/win98",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "win98-host-tdm",
+      "configurePreset": "win98-host-tdm"
+    }
+  ]
+}
