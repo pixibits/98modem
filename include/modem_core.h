@@ -9,7 +9,7 @@
 #define VMODEM_MODEM_CORE_H
 
 #define VM_MODEM_CMD_BUFFER_LEN      128U
-#define VM_MODEM_OUTPUT_BUFFER_LEN  1024U
+#define VM_MODEM_OUTPUT_BUFFER_LEN  8192U
 #define VM_MODEM_ACTION_QUEUE_LEN     16U
 #define VM_MODEM_ACTION_PAYLOAD_LEN  256U
 #define VM_MODEM_ESCAPE_GUARD_MS     500UL
@@ -57,6 +57,8 @@ typedef struct VM_MODEM_CORE {
     int            host_dtr_asserted;
     int            host_rts_asserted;
     int            raw_mode_enabled;
+    unsigned char  quiet_mode;
+    int            numeric_responses;
     unsigned long  next_session_id;
     unsigned long  current_session_id;
     unsigned long  s0_auto_answer_rings;

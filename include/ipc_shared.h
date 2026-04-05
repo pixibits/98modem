@@ -87,6 +87,8 @@
 #define VMODEM_DOS_UART_IRQ_MODEM_STATUS  0x00000001UL
 #define VMODEM_DOS_UART_IRQ_THR_EMPTY     0x00000002UL
 #define VMODEM_DOS_UART_IRQ_RX_DATA       0x00000004UL
+#define VMODEM_DOS_UART_IRQ_LINE_STATUS   0x00000008UL
+#define VMODEM_DOS_UART_IRQ_FIFO_TIMEOUT  0x00000010UL
 
 #pragma pack(push, 1)
 
@@ -100,16 +102,18 @@ typedef struct {
     unsigned long pending_irq;      /* VMODEM_DOS_UART_IRQ_* bitmask */
     unsigned long rx_fifo_depth;    /* current RX FIFO bytes */
     unsigned long tx_fifo_depth;    /* current TX staging bytes */
-    unsigned char ier;
-    unsigned char iir;
-    unsigned char fcr;
-    unsigned char lcr;
-    unsigned char mcr;
-    unsigned char lsr;
-    unsigned char msr;
-    unsigned char scr;
-    unsigned char dll;
-    unsigned char dlm;
+    unsigned char  ier;
+    unsigned char  iir;
+    unsigned char  fcr;
+    unsigned char  lcr;
+    unsigned char  mcr;
+    unsigned char  lsr;
+    unsigned char  msr;
+    unsigned char  scr;
+    unsigned char  dll;
+    unsigned char  dlm;
+    unsigned short rx_interrupt_threshold;
+    unsigned long  loopback_active;
 } VMODEM_DOS_UART_DIAGNOSTIC;
 
 /* Sent by the helper in the input buffer of VMODEM_IOCTL_HELLO. */

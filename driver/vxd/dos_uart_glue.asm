@@ -7,6 +7,7 @@ TITLE DOS_UART_GLUE - DOS UART trap and VMM helper shims for VMODEM
         include VMM.INC
         include DEBUG.INC
         include VPICD.INC
+        include VTD.INC
         .list
 
 extrn _DOSUART_OnIoTrap:near
@@ -104,6 +105,30 @@ ArgVar  hIrq, DWORD
         return
 
 EndProc DOSUART_ClearIntRequest
+
+BeginProc DOSUART_BeginFastPeriod, CCALL, PUBLIC
+
+ArgVar  period, DWORD
+
+        EnterProc
+        mov     eax, period
+        VxDCall VTD_Begin_Min_Int_Period
+        LeaveProc
+        return
+
+EndProc DOSUART_BeginFastPeriod
+
+BeginProc DOSUART_EndFastPeriod, CCALL, PUBLIC
+
+ArgVar  period, DWORD
+
+        EnterProc
+        mov     eax, period
+        VxDCall VTD_End_Min_Int_Period
+        LeaveProc
+        return
+
+EndProc DOSUART_EndFastPeriod
 
         PUBLIC  _DOSUART_IoTrapThunk
 _DOSUART_IoTrapThunk PROC NEAR

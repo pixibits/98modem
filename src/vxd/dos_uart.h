@@ -23,6 +23,7 @@
 
 #define VM_DOS_UART_IER_RX_DATA      0x01U
 #define VM_DOS_UART_IER_THR_EMPTY    0x02U
+#define VM_DOS_UART_IER_LINE_STATUS  0x04U
 #define VM_DOS_UART_IER_MODEM_STATUS 0x08U
 
 #define VM_DOS_UART_FCR_ENABLE       0x01U
@@ -39,8 +40,15 @@
 
 #define VM_DOS_UART_LSR_DR           0x01U
 #define VM_DOS_UART_LSR_OE           0x02U
+#define VM_DOS_UART_LSR_PE           0x04U
+#define VM_DOS_UART_LSR_FE           0x08U
+#define VM_DOS_UART_LSR_BI           0x10U
 #define VM_DOS_UART_LSR_THRE         0x20U
 #define VM_DOS_UART_LSR_TEMT         0x40U
+#define VM_DOS_UART_LSR_ERROR_MASK   (VM_DOS_UART_LSR_OE | \
+                                      VM_DOS_UART_LSR_PE | \
+                                      VM_DOS_UART_LSR_FE | \
+                                      VM_DOS_UART_LSR_BI)
 
 #define VM_DOS_UART_MSR_DCTS         0x01U
 #define VM_DOS_UART_MSR_DDSR         0x02U
@@ -54,6 +62,8 @@
 #define VM_DOS_UART_IIR_MODEM_STATUS 0x00U
 #define VM_DOS_UART_IIR_THR_EMPTY    0x02U
 #define VM_DOS_UART_IIR_RX_DATA      0x04U
+#define VM_DOS_UART_IIR_LINE_STATUS  0x06U
+#define VM_DOS_UART_IIR_FIFO_TIMEOUT 0x0CU
 #define VM_DOS_UART_IIR_NONE         0x01U
 #define VM_DOS_UART_IIR_FIFO_BITS    0xC0U
 
@@ -63,6 +73,7 @@
 #define VM_DOS_UART_EVENT_TX_RESET           0x00000008UL
 #define VM_DOS_UART_EVENT_IRQ_CHANGED        0x00000010UL
 #define VM_DOS_UART_EVENT_MODEM_CHANGED      0x00000020UL
+#define VM_DOS_UART_EVENT_RX_TIMEOUT         0x00000040UL
 
 typedef struct VM_DOS_UART_FIFO {
     unsigned char data[VM_DOS_UART_FIFO_CAPACITY];
@@ -87,6 +98,10 @@ typedef struct VM_DOS_UART_STATE {
     unsigned char  fcr;
     unsigned long  pending_irq;
     int            irq_asserted;
+    unsigned short rx_interrupt_threshold;
+    int            rx_timeout_armed;
+    int            rx_timeout_fired;
+    unsigned short rx_timeout_counter;
     VM_DOS_UART_FIFO rx_fifo;
     VM_DOS_UART_FIFO tx_fifo;
 } VM_DOS_UART_STATE;
@@ -131,6 +146,7 @@ void vm_dos_uart_apply_modem_status(VM_DOS_UART_STATE *uart,
                                     int clear_delta_bits,
                                     VM_DOS_UART_EVENT *event);
 
+void vm_dos_uart_tick(VM_DOS_UART_STATE *uart, VM_DOS_UART_EVENT *event);
 unsigned char vm_dos_uart_read_inert(unsigned short offset);
 unsigned char vm_dos_uart_get_iir(const VM_DOS_UART_STATE *uart);
 unsigned long vm_dos_uart_get_pending_irq(const VM_DOS_UART_STATE *uart);

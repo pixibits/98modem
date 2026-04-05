@@ -202,11 +202,18 @@ extern void __cdecl DOSUART_SetIntRequest(DWORD hIrq, DWORD vmHandle);
 extern void __cdecl DOSUART_ClearIntRequest(DWORD hIrq);
 extern void __cdecl DOSUART_IoTrapThunk(void);
 extern void __cdecl DOSUART_HwIrqThunk(void);
+extern void __cdecl DOSUART_BeginFastPeriod(DWORD periodMs);
+extern void __cdecl DOSUART_EndFastPeriod(DWORD periodMs);
 
 static void vm_update_msr_shadow(VModemPort *port);
 static void vm_cancel_modem_timer(void);
 static void __cdecl vm_modem_timer_callback(void);
 static void vm_refresh_modem_timer(VModemPort *port);
+static void vm_cancel_dos_uart_timer(void);
+static void __cdecl vm_dos_uart_timer_callback(void);
+static void vm_refresh_dos_uart_timer(void);
+static void vm_begin_dos_fast_period(void);
+static void vm_end_dos_fast_period(void);
 static void vm_poll_modem_core(VModemPort *port);
 static void vm_sync_from_modem_core(VModemPort *port);
 static void vm_flush_rx_notify(VModemPort *port);
@@ -217,6 +224,7 @@ static void vm_buf_append_u32_hex(char *buf, int *pPos, int cchBuf, DWORD value)
 static void vm_trace_log_line(const char *text);
 static void vm_trace_log_command_line(void);
 static void vm_trace_capture_tx_for_log(const BYTE *bytes, DWORD count);
+static void vm_trace_log_modem_tx(const BYTE *bytes, DWORD count);
 static void vm_trace_log_local_serial_rx(const BYTE *bytes, DWORD count);
 static DWORD vm_enqueue_rx_bytes(VModemPort *port, const BYTE *bytes, DWORD count);
 static void vm_reset_held_helper_rx(VModemPort *port);
@@ -261,6 +269,8 @@ static DWORD g_lastMsgToHelper = VMODEM_MSG_NONE;
 static DWORD g_lastMsgFromHelper = VMODEM_MSG_NONE;
 static HTIMEOUT g_hModemTimer = 0;
 static DWORD g_modemTimerDue = 0;
+static HTIMEOUT g_hDosUartTimer = 0;
+static BOOL g_bDosUartFastPeriod = FALSE;
 
 /* IFS hook state.
  * g_ppPrevIfsHook = ppIFSFileHookFunc returned by IFSMgr_InstallFileSystemApiHook.
@@ -291,6 +301,9 @@ static char  g_traceLog[VMODEM_TRACE_LOG_DATA_LEN];
 static unsigned short g_traceCmdLen = 0;
 static BOOL  g_traceCmdOverflowed = FALSE;
 static char  g_traceCmdBuffer[VM_TRACE_CMD_BUFFER_LEN];
+static DWORD g_dosReadSuppressOffset = 0xFFFFFFFFUL;
+static DWORD g_dosReadSuppressValue  = 0xFFFFFFFFUL;
+static DWORD g_dosReadSuppressCount  = 0;
 
 BOOL __cdecl VM_PortClose(DWORD hPort);
 BOOL __cdecl VM_PortSetCommState(DWORD hPort, _DCB *pDcb, DWORD ActionMask);
@@ -499,6 +512,32 @@ static BOOL vm_dos_map_port_identity(const char *portName,
     return FALSE;
 }
 
+static void vm_dos_trace_flush_read_suppress(void)
+{
+    char line[80];
+    int pos;
+
+    if (g_dosReadSuppressCount == 0) {
+        return;
+    }
+
+    if (g_dosReadSuppressCount > 1) {
+        pos = 0;
+        line[0] = '\0';
+        vm_buf_append_str(line, &pos, sizeof(line), "DOSUART_READ_x");
+        vm_buf_append_u32_dec(line, &pos, sizeof(line), g_dosReadSuppressCount);
+        vm_buf_append_str(line, &pos, sizeof(line), " off=");
+        vm_buf_append_u32_hex(line, &pos, sizeof(line), g_dosReadSuppressOffset);
+        vm_buf_append_str(line, &pos, sizeof(line), " value=");
+        vm_buf_append_u32_hex(line, &pos, sizeof(line), g_dosReadSuppressValue);
+        vm_trace_log_line(line);
+    }
+
+    g_dosReadSuppressOffset = 0xFFFFFFFFUL;
+    g_dosReadSuppressValue  = 0xFFFFFFFFUL;
+    g_dosReadSuppressCount  = 0;
+}
+
 static void vm_dos_trace_register_access(const char *prefix,
                                          DWORD vmId,
                                          DWORD port,
@@ -507,6 +546,26 @@ static void vm_dos_trace_register_access(const char *prefix,
 {
     char line[160];
     int pos;
+    int is_read;
+
+    is_read = (prefix[7] == 'R' && prefix[8] == 'E' &&
+               prefix[9] == 'A' && prefix[10] == 'D' &&
+               prefix[11] == '\0');
+
+    if (is_read) {
+        if (offset == g_dosReadSuppressOffset &&
+            value  == g_dosReadSuppressValue) {
+            ++g_dosReadSuppressCount;
+            return;
+        }
+        vm_dos_trace_flush_read_suppress();
+        g_dosReadSuppressOffset = offset;
+        g_dosReadSuppressValue  = value;
+        g_dosReadSuppressCount  = 1;
+        /* fall through to log the first occurrence */
+    } else {
+        vm_dos_trace_flush_read_suppress();
+    }
 
     pos = 0;
     line[0] = '\0';
@@ -632,6 +691,7 @@ static DWORD vm_enqueue_dos_rx_bytes(const BYTE *bytes, DWORD count)
     }
 
     vm_dos_update_irq_request();
+    vm_refresh_dos_uart_timer();
     return written;
 }
 
@@ -710,6 +770,7 @@ static void vm_dos_release_owner(const char *reason)
             vm_cancel_modem_timer();
         }
     }
+    vm_cancel_dos_uart_timer();
 
     pos = 0;
     line[0] = '\0';
@@ -1692,6 +1753,90 @@ static void vm_refresh_modem_timer(VModemPort *port)
     }
 }
 
+#define VM_DOS_UART_FAST_PERIOD_MS 1UL
+
+static void vm_begin_dos_fast_period(void)
+{
+    if (g_bDosUartFastPeriod) {
+        return;
+    }
+    DOSUART_BeginFastPeriod(VM_DOS_UART_FAST_PERIOD_MS);
+    g_bDosUartFastPeriod = TRUE;
+}
+
+static void vm_end_dos_fast_period(void)
+{
+    if (!g_bDosUartFastPeriod) {
+        return;
+    }
+    DOSUART_EndFastPeriod(VM_DOS_UART_FAST_PERIOD_MS);
+    g_bDosUartFastPeriod = FALSE;
+}
+
+static void vm_cancel_dos_uart_timer(void)
+{
+    if (g_hDosUartTimer != 0) {
+        Cancel_Time_Out(g_hDosUartTimer);
+        g_hDosUartTimer = 0;
+    }
+    vm_end_dos_fast_period();
+}
+
+static void __cdecl vm_dos_uart_timer_callback(void)
+{
+    VM_DOS_UART_EVENT event;
+
+    g_hDosUartTimer = 0;
+
+    if (!g_DosUart.bOwnerActive) {
+        return;
+    }
+
+    vm_dos_uart_tick(&g_DosUart.uart, &event);
+    vm_sync_from_modem_core(&g_Port);
+
+    if ((event.flags & VM_DOS_UART_EVENT_RX_TIMEOUT) != 0UL) {
+        vm_dos_update_irq_request();
+    }
+
+    vm_refresh_dos_uart_timer();
+}
+
+static void vm_refresh_dos_uart_timer(void)
+{
+    int needTimer;
+
+    if (!g_DosUart.bOwnerActive) {
+        vm_cancel_dos_uart_timer();
+        return;
+    }
+
+    /* Keep the timer running if the FIFO timeout is pending OR if the modem
+     * output buffer has data waiting to be pushed into the FIFO. */
+    needTimer = (g_DosUart.uart.rx_timeout_armed &&
+                 !g_DosUart.uart.rx_timeout_fired) ||
+                (vm_modem_output_count(&g_Port.modem) > 0U);
+
+    if (!needTimer) {
+        vm_cancel_dos_uart_timer();
+        return;
+    }
+
+    /* Acquire the fast timer period only while modem output is pending.
+     * The FIFO timeout path alone does not need sub-millisecond latency. */
+    if (vm_modem_output_count(&g_Port.modem) > 0U) {
+        vm_begin_dos_fast_period();
+    } else {
+        vm_end_dos_fast_period();
+    }
+
+    if (g_hDosUartTimer != 0) {
+        return;
+    }
+
+    g_hDosUartTimer = Set_Global_Time_Out(vm_dos_uart_timer_callback, 1, 0);
+}
+
 static void vm_sync_modem_actions_to_helper(VModemPort *port)
 {
     VM_MODEM_ACTION action;
@@ -1826,6 +1971,7 @@ static void vm_process_modem_tx(VModemPort *port, const BYTE *bytes, DWORD count
 
     now = VM_Get_System_Time();
     vm_modem_poll(&port->modem, now);
+    vm_trace_log_modem_tx(bytes, count);
     vm_trace_capture_tx_for_log(bytes, count);
 
     remaining = count;
@@ -2312,6 +2458,39 @@ static void vm_trace_log_local_serial_rx(const BYTE *bytes, DWORD count)
     pos = 0;
     line[0] = '\0';
     vm_buf_append_str(line, &pos, sizeof(line), "MODEM_RX len=");
+    vm_buf_append_u32_dec(line, &pos, sizeof(line), count);
+    vm_buf_append_str(line, &pos, sizeof(line), " text=");
+
+    limit = count;
+    if (limit > 48UL) {
+        limit = 48UL;
+    }
+
+    for (i = 0; i < limit; ++i) {
+        vm_buf_append_escaped_byte(line, &pos, sizeof(line), bytes[i]);
+    }
+
+    if (limit < count) {
+        vm_buf_append_str(line, &pos, sizeof(line), "...");
+    }
+
+    vm_trace_log_line(line);
+}
+
+static void vm_trace_log_modem_tx(const BYTE *bytes, DWORD count)
+{
+    char line[192];
+    int pos;
+    DWORD i;
+    DWORD limit;
+
+    if (bytes == 0 || count == 0) {
+        return;
+    }
+
+    pos = 0;
+    line[0] = '\0';
+    vm_buf_append_str(line, &pos, sizeof(line), "MODEM_TX len=");
     vm_buf_append_u32_dec(line, &pos, sizeof(line), count);
     vm_buf_append_str(line, &pos, sizeof(line), " text=");
 
@@ -2946,10 +3125,9 @@ DWORD __cdecl DOSUART_OnIoTrap(DWORD vmId,
         if (g_Port.bHoldHelperRxUntilRead) {
             g_Port.bHoldHelperRxUntilRead = FALSE;
         }
-        vm_sync_from_modem_core(&g_Port);
-    } else {
-        vm_dos_update_irq_request();
     }
+    vm_dos_update_irq_request();
+    vm_refresh_dos_uart_timer();
 
     return readValue;
 }

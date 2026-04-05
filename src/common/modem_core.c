@@ -9,12 +9,18 @@
 #include "ipc_shared.h"
 #include "modem_core.h"
 
-#define VM_MODEM_RESULT_OK          "OK"
-#define VM_MODEM_RESULT_ERROR       "ERROR"
 #define VM_MODEM_RESULT_CONNECT     "CONNECT"
 #define VM_MODEM_RESULT_RING        "RING"
 #define VM_MODEM_RESULT_NO_ANSWER   "NO ANSWER"
 #define VM_MODEM_RESULT_NO_CARRIER  "NO CARRIER"
+
+#define VM_RC_OK            0U
+#define VM_RC_CONNECT       1U
+#define VM_RC_RING          2U
+#define VM_RC_NO_CARRIER    3U
+#define VM_RC_ERROR         4U
+#define VM_RC_NO_ANSWER     8U
+#define VM_RC_NONE          0xFFFFU
 
 static void vm_modem_sync_status(VM_MODEM_CORE *modem);
 static void vm_modem_reset_command(VM_MODEM_CORE *modem);
@@ -38,17 +44,11 @@ static void vm_modem_enter_connected_data(VM_MODEM_CORE *modem,
 static void vm_modem_enter_connected_cmd(VM_MODEM_CORE *modem);
 static void vm_modem_start_ringing(VM_MODEM_CORE *modem,
                                    unsigned long now_ms);
-static const char *vm_modem_connect_fail_result(unsigned long reason);
+static unsigned int vm_modem_connect_fail_result(unsigned long reason);
 static unsigned char vm_modem_ascii_upper(unsigned char ch);
-static int vm_modem_command_equals(const VM_MODEM_CORE *modem,
-                                   unsigned short start,
-                                   const char *text);
 static int vm_modem_command_starts_with(const VM_MODEM_CORE *modem,
                                         unsigned short start,
                                         const char *text);
-static int vm_modem_parse_decimal_tail(const VM_MODEM_CORE *modem,
-                                       unsigned short start,
-                                       unsigned long *value_out);
 static int vm_modem_is_valid_destination(const VM_MODEM_CORE *modem,
                                          unsigned short start);
 static int vm_modem_queue_action(VM_MODEM_CORE *modem,
@@ -67,7 +67,11 @@ static void vm_modem_flush_pending_escape(VM_MODEM_CORE *modem,
                                           unsigned long session_id);
 static void vm_modem_terminate_session(VM_MODEM_CORE *modem,
                                        int queue_hangup,
-                                       const char *result_text);
+                                       unsigned int result_code);
+static unsigned short vm_modem_scan_uint(const VM_MODEM_CORE *modem,
+                                          unsigned short pos,
+                                          unsigned long *value_out);
+static void vm_modem_send_result(VM_MODEM_CORE *modem, unsigned int code);
 static void vm_modem_process_command(VM_MODEM_CORE *modem,
                                      unsigned long now_ms);
 
@@ -222,6 +226,37 @@ static void vm_modem_queue_value_result(VM_MODEM_CORE *modem,
     vm_modem_queue_bytes(modem, crlf, 2);
 }
 
+static void vm_modem_send_result(VM_MODEM_CORE *modem, unsigned int code)
+{
+    static const char * const verbose_text[] = {
+        "OK",         /* 0 */
+        "CONNECT",    /* 1 */
+        "RING",       /* 2 */
+        "NO CARRIER", /* 3 */
+        "ERROR",      /* 4 */
+        0, 0, 0,      /* 5-7 unused */
+        "NO ANSWER"   /* 8 */
+    };
+
+    if (modem == 0 || code == VM_RC_NONE) {
+        return;
+    }
+    if (modem->quiet_mode == 1) {
+        return;
+    }
+    if (modem->quiet_mode == 2 &&
+        (code == VM_RC_RING ||
+         code == VM_RC_CONNECT ||
+         code == VM_RC_NO_CARRIER)) {
+        return;
+    }
+    if (modem->numeric_responses) {
+        vm_modem_queue_value_result(modem, "", (unsigned long)code);
+    } else if (code < 9U && verbose_text[code] != 0) {
+        vm_modem_queue_result(modem, verbose_text[code]);
+    }
+}
+
 static int vm_modem_time_reached(unsigned long now_ms,
                                  unsigned long deadline_ms)
 {
@@ -329,7 +364,7 @@ static void vm_modem_start_ringing(VM_MODEM_CORE *modem,
                                    0UL,
                                    0,
                                    0U)) {
-            vm_modem_terminate_session(modem, 1, VM_MODEM_RESULT_NO_CARRIER);
+            vm_modem_terminate_session(modem, 1, VM_RC_NO_CARRIER);
             return;
         }
         modem->state = VM_MODEM_STATE_DIALING;
@@ -338,16 +373,16 @@ static void vm_modem_start_ringing(VM_MODEM_CORE *modem,
         return;
     }
 
-    vm_modem_queue_result(modem, VM_MODEM_RESULT_RING);
+    vm_modem_send_result(modem, VM_RC_RING);
 }
 
-static const char *vm_modem_connect_fail_result(unsigned long reason)
+static unsigned int vm_modem_connect_fail_result(unsigned long reason)
 {
     if (reason == VMODEM_CONNECT_FAIL_TIMEOUT) {
-        return VM_MODEM_RESULT_NO_ANSWER;
+        return VM_RC_NO_ANSWER;
     }
 
-    return VM_MODEM_RESULT_NO_CARRIER;
+    return VM_RC_NO_CARRIER;
 }
 
 static unsigned char vm_modem_ascii_upper(unsigned char ch)
@@ -361,33 +396,6 @@ static unsigned char vm_modem_ascii_upper(unsigned char ch)
 static int vm_modem_is_command_printable(unsigned char ch)
 {
     return (ch >= 0x20U && ch <= 0x7EU) ? 1 : 0;
-}
-
-static int vm_modem_command_equals(const VM_MODEM_CORE *modem,
-                                   unsigned short start,
-                                   const char *text)
-{
-    unsigned short i;
-    unsigned char ch;
-
-    if (modem == 0 || text == 0 || start > modem->command_length) {
-        return 0;
-    }
-
-    i = start;
-    while (*text != '\0') {
-        if (i >= modem->command_length) {
-            return 0;
-        }
-        ch = vm_modem_ascii_upper(modem->command_buffer[i]);
-        if (ch != (unsigned char)(*text)) {
-            return 0;
-        }
-        ++i;
-        ++text;
-    }
-
-    return (i == modem->command_length) ? 1 : 0;
 }
 
 static int vm_modem_command_starts_with(const VM_MODEM_CORE *modem,
@@ -417,34 +425,24 @@ static int vm_modem_command_starts_with(const VM_MODEM_CORE *modem,
     return 1;
 }
 
-static int vm_modem_parse_decimal_tail(const VM_MODEM_CORE *modem,
-                                       unsigned short start,
-                                       unsigned long *value_out)
+static unsigned short vm_modem_scan_uint(const VM_MODEM_CORE *modem,
+                                          unsigned short pos,
+                                          unsigned long *value_out)
 {
     unsigned long value;
-    unsigned short i;
-    unsigned char ch;
 
-    if (modem == 0 ||
-        value_out == 0 ||
-        start >= modem->command_length) {
-        return 0;
+    if (modem == 0 || value_out == 0) {
+        return pos;
     }
-
     value = 0UL;
-    for (i = start; i < modem->command_length; ++i) {
-        ch = modem->command_buffer[i];
-        if (ch < '0' || ch > '9') {
-            return 0;
-        }
+    while (pos < modem->command_length) {
+        unsigned char ch = modem->command_buffer[pos];
+        if (ch < '0' || ch > '9') break;
         value = (value * 10UL) + (unsigned long)(ch - '0');
-        if (value > 255UL) {
-            return 0;
-        }
+        ++pos;
     }
-
     *value_out = value;
-    return 1;
+    return pos;
 }
 
 static int vm_modem_is_valid_destination(const VM_MODEM_CORE *modem,
@@ -637,7 +635,7 @@ static void vm_modem_flush_pending_escape(VM_MODEM_CORE *modem,
 
 static void vm_modem_terminate_session(VM_MODEM_CORE *modem,
                                        int queue_hangup,
-                                       const char *result_text)
+                                       unsigned int result_code)
 {
     unsigned long session_id;
 
@@ -663,205 +661,287 @@ static void vm_modem_terminate_session(VM_MODEM_CORE *modem,
         vm_modem_enter_helper_unavailable(modem);
     }
 
-    if (result_text != 0) {
-        vm_modem_queue_result(modem, result_text);
-    }
+    vm_modem_send_result(modem, result_code);
 }
 
 static void vm_modem_process_command(VM_MODEM_CORE *modem,
                                      unsigned long now_ms)
 {
+    unsigned short pos;
+    unsigned short old_pos;
+    unsigned char ch;
     unsigned char ch2;
     unsigned long value;
+    unsigned long reg_value;
 
     if (modem == 0) {
         return;
     }
 
     if (modem->command_overflowed || modem->command_length < 2) {
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
+        vm_modem_send_result(modem, VM_RC_ERROR);
         vm_modem_reset_command(modem);
         return;
     }
 
     if (vm_modem_ascii_upper(modem->command_buffer[0]) != 'A' ||
         vm_modem_ascii_upper(modem->command_buffer[1]) != 'T') {
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
+        vm_modem_send_result(modem, VM_RC_ERROR);
         vm_modem_reset_command(modem);
         return;
     }
 
-    if (modem->command_length == 2) {
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
+    pos = 2;
 
-    if (vm_modem_command_equals(modem, 2, "E0")) {
-        modem->echo_enabled = 0;
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
+    while (pos < modem->command_length) {
+        ch = vm_modem_ascii_upper(modem->command_buffer[pos]);
+        ++pos;
 
-    if (vm_modem_command_equals(modem, 2, "E1")) {
-        modem->echo_enabled = 1;
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "M0") ||
-        vm_modem_command_equals(modem, 2, "M1")) {
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "+VRAW?")) {
-        vm_modem_queue_value_result(modem,
-                                    "+VRAW: ",
-                                    modem->raw_mode_enabled ? 1UL : 0UL);
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_starts_with(modem, 2, "+VRAW=") &&
-        modem->command_length == 9U) {
-        if (modem->command_buffer[8] == '0') {
-            modem->raw_mode_enabled = 0;
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        } else if (modem->command_buffer[8] == '1') {
-            modem->raw_mode_enabled = 1;
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        } else {
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-        }
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "S0?")) {
-        vm_modem_queue_value_result(modem, "", modem->s0_auto_answer_rings);
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "S1?")) {
-        vm_modem_queue_value_result(modem, "", modem->s1_ring_count);
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_starts_with(modem, 2, "S0=") &&
-        vm_modem_parse_decimal_tail(modem, 5U, &value)) {
-        modem->s0_auto_answer_rings = value;
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_starts_with(modem, 2, "S1=")) {
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "Z")) {
-        modem->echo_enabled = 1;
-        modem->raw_mode_enabled = 1;
-        modem->s0_auto_answer_rings = 0UL;
-        modem->s1_ring_count = 0UL;
-        vm_modem_terminate_session(modem, 1, VM_MODEM_RESULT_OK);
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "A")) {
-        if (modem->state == VM_MODEM_STATE_RINGING &&
-            modem->helper_available &&
-            modem->current_session_id != 0) {
-            vm_modem_clear_actions(modem);
-            if (!vm_modem_queue_action(modem,
-                                       VM_MODEM_ACTION_ANSWER_REQ,
-                                       modem->current_session_id,
-                                       0,
-                                       0,
-                                       0)) {
-                vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
+        switch (ch) {
+        case ' ':
+            break; /* space between sub-commands — skip */
+        case 'E':
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value == 0) {
+                modem->echo_enabled = 0;
+            } else if (value == 1) {
+                modem->echo_enabled = 1;
             } else {
+                goto send_error;
+            }
+            break;
+
+        case 'Q':
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value <= 2) {
+                modem->quiet_mode = (unsigned char)value;
+            } else {
+                goto send_error;
+            }
+            break;
+
+        case 'V':
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value == 0) {
+                modem->numeric_responses = 1;
+            } else if (value == 1) {
+                modem->numeric_responses = 0;
+            } else {
+                goto send_error;
+            }
+            break;
+
+        case 'X':
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value > 4) {
+                goto send_error;
+            }
+            /* stub: we always send full responses regardless of level */
+            break;
+
+        case 'M': /* speaker mode - stub */
+        case 'L': /* volume - stub */
+        case 'T': /* tone dial - ignored */
+        case 'P': /* pulse dial - ignored */
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            break;
+
+        case 'I': /* firmware info - stub */
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            break;
+
+        case 'Z': /* reset */
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            modem->echo_enabled = 1;
+            modem->raw_mode_enabled = 1;
+            modem->quiet_mode = 0;
+            modem->numeric_responses = 0;
+            modem->s0_auto_answer_rings = 0UL;
+            modem->s1_ring_count = 0UL;
+            vm_modem_terminate_session(modem, 1, VM_RC_NONE);
+            vm_modem_reset_command(modem);
+            vm_modem_send_result(modem, VM_RC_OK);
+            return;
+
+        case 'A': /* answer incoming call */
+            if (modem->state == VM_MODEM_STATE_RINGING &&
+                modem->helper_available &&
+                modem->current_session_id != 0) {
+                vm_modem_clear_actions(modem);
+                if (!vm_modem_queue_action(modem,
+                                           VM_MODEM_ACTION_ANSWER_REQ,
+                                           modem->current_session_id,
+                                           0, 0, 0)) {
+                    goto send_error;
+                }
                 modem->state = VM_MODEM_STATE_DIALING;
                 vm_modem_reset_ring_state(modem);
                 vm_modem_sync_status(modem);
-            }
-        } else {
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-        }
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "O")) {
-        if (modem->state == VM_MODEM_STATE_CONNECTED_CMD &&
-            modem->current_session_id != 0) {
-            vm_modem_enter_connected_data(modem, now_ms);
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_CONNECT);
-        } else {
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-        }
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    if (vm_modem_command_equals(modem, 2, "H0")) {
-        if (modem->state == VM_MODEM_STATE_CONNECTED_CMD ||
-            modem->state == VM_MODEM_STATE_DIALING ||
-            modem->state == VM_MODEM_STATE_RINGING) {
-            vm_modem_terminate_session(modem, 1, VM_MODEM_RESULT_OK);
-        } else if (modem->state == VM_MODEM_STATE_IDLE_CMD ||
-                   modem->state == VM_MODEM_STATE_HELPER_UNAVAILABLE) {
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
-        } else {
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-        }
-        vm_modem_reset_command(modem);
-        return;
-    }
-
-    ch2 = vm_modem_ascii_upper(modem->command_buffer[2]);
-    if ((ch2 == 'D') &&
-        (modem->state == VM_MODEM_STATE_IDLE_CMD ||
-         modem->state == VM_MODEM_STATE_HELPER_UNAVAILABLE) &&
-        modem->command_length >= 4) {
-        if (vm_modem_ascii_upper(modem->command_buffer[3]) == 'T' ||
-            vm_modem_ascii_upper(modem->command_buffer[3]) == 'P') {
-            if (!vm_modem_is_valid_destination(modem, 4)) {
-                vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
-            } else if (!modem->helper_available) {
-                vm_modem_enter_helper_unavailable(modem);
-                vm_modem_queue_result(modem, VM_MODEM_RESULT_NO_CARRIER);
             } else {
-                modem->current_session_id = modem->next_session_id++;
-                vm_modem_clear_actions(modem);
-                if (!vm_modem_queue_connect_request(modem, 4)) {
-                    modem->current_session_id = 0;
-                    vm_modem_enter_idle(modem);
-                    vm_modem_queue_result(modem, VM_MODEM_RESULT_NO_CARRIER);
-                } else {
-                    modem->state = VM_MODEM_STATE_DIALING;
-                    vm_modem_sync_status(modem);
-                }
+                goto send_error;
             }
             vm_modem_reset_command(modem);
+            return; /* no OK yet — wait for CONNECT or fail */
+
+        case 'O': /* return to data mode */
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value != 0) {
+                goto send_error;
+            }
+            if (modem->state == VM_MODEM_STATE_CONNECTED_CMD &&
+                modem->current_session_id != 0) {
+                vm_modem_enter_connected_data(modem, now_ms);
+                vm_modem_reset_command(modem);
+                vm_modem_send_result(modem, VM_RC_CONNECT);
+                return;
+            }
+            goto send_error;
+
+        case 'H': /* hang up */
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            if (value != 0) {
+                goto send_error;
+            }
+            if (modem->state == VM_MODEM_STATE_CONNECTED_DATA ||
+                modem->state == VM_MODEM_STATE_CONNECTED_CMD ||
+                modem->state == VM_MODEM_STATE_DIALING ||
+                modem->state == VM_MODEM_STATE_RINGING) {
+                vm_modem_terminate_session(modem, 1, VM_RC_NONE);
+            }
+            vm_modem_reset_command(modem);
+            vm_modem_send_result(modem, VM_RC_OK);
             return;
+
+        case 'D': /* dial — consumes rest of command line */
+            if (pos < modem->command_length) {
+                ch2 = vm_modem_ascii_upper(modem->command_buffer[pos]);
+                if (ch2 == 'T' || ch2 == 'P') {
+                    ++pos;
+                }
+            }
+            if (!vm_modem_is_valid_destination(modem, pos)) {
+                goto send_error;
+            }
+            if (!modem->helper_available) {
+                vm_modem_enter_helper_unavailable(modem);
+                vm_modem_reset_command(modem);
+                vm_modem_send_result(modem, VM_RC_NO_CARRIER);
+                return;
+            }
+            modem->current_session_id = modem->next_session_id++;
+            vm_modem_clear_actions(modem);
+            if (!vm_modem_queue_connect_request(modem, pos)) {
+                modem->current_session_id = 0;
+                vm_modem_enter_idle(modem);
+                vm_modem_reset_command(modem);
+                vm_modem_send_result(modem, VM_RC_NO_CARRIER);
+                return;
+            }
+            modem->state = VM_MODEM_STATE_DIALING;
+            vm_modem_sync_status(modem);
+            vm_modem_reset_command(modem);
+            return; /* no OK yet — wait for CONNECT or fail */
+
+        case 'S': { /* S-register read/write */
+            pos = vm_modem_scan_uint(modem, pos, &value); /* register index */
+            if (pos >= modem->command_length) {
+                goto send_error;
+            }
+            if (modem->command_buffer[pos] == '=') {
+                ++pos;
+                old_pos = pos;
+                pos = vm_modem_scan_uint(modem, pos, &reg_value);
+                if (pos == old_pos) {
+                    goto send_error; /* no digits after = */
+                }
+                if (value == 0) {
+                    modem->s0_auto_answer_rings = reg_value;
+                } else if (value == 1) {
+                    goto send_error; /* S1 is read-only */
+                }
+                /* other S-registers: accept and silently ignore */
+            } else if (modem->command_buffer[pos] == '?') {
+                ++pos;
+                if (value == 0) {
+                    vm_modem_queue_value_result(modem, "",
+                                                modem->s0_auto_answer_rings);
+                } else if (value == 1) {
+                    vm_modem_queue_value_result(modem, "",
+                                                modem->s1_ring_count);
+                } else {
+                    vm_modem_queue_value_result(modem, "", 0UL);
+                }
+            } else {
+                goto send_error;
+            }
+            break;
+        }
+
+        case '&': { /* &-prefix commands */
+            if (pos >= modem->command_length) {
+                goto send_error;
+            }
+            ch2 = vm_modem_ascii_upper(modem->command_buffer[pos]);
+            ++pos;
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            switch (ch2) {
+            case 'C': if (value > 1) goto send_error; break; /* DCD - stub */
+            case 'D': if (value > 3) goto send_error; break; /* DTR - stub */
+            case 'K': if (value > 5) goto send_error; break; /* flow ctrl - stub */
+            default:  goto send_error;
+            }
+            break;
+        }
+
+        case '+': { /* multi-character + commands */
+            if (vm_modem_command_starts_with(modem, pos, "VRAW?") &&
+                pos + 5U == modem->command_length) {
+                vm_modem_queue_value_result(modem, "+VRAW: ",
+                                            modem->raw_mode_enabled ? 1UL : 0UL);
+                pos += 5U;
+            } else if (vm_modem_command_starts_with(modem, pos, "VRAW=") &&
+                       pos + 6U <= modem->command_length) {
+                ch2 = modem->command_buffer[pos + 5U];
+                if (ch2 == '0') {
+                    modem->raw_mode_enabled = 0;
+                } else if (ch2 == '1') {
+                    modem->raw_mode_enabled = 1;
+                } else {
+                    goto send_error;
+                }
+                pos += 6U;
+            } else {
+                goto send_error;
+            }
+            break;
+        }
+
+        case '\\': { /* \-prefix commands */
+            if (pos >= modem->command_length) {
+                goto send_error;
+            }
+            ch2 = vm_modem_ascii_upper(modem->command_buffer[pos]);
+            ++pos;
+            pos = vm_modem_scan_uint(modem, pos, &value);
+            switch (ch2) {
+            case 'N': if (value > 5) goto send_error; break; /* error corr - stub */
+            default:  goto send_error;
+            }
+            break;
+        }
+
+        default:
+            goto send_error;
         }
     }
 
-    vm_modem_queue_result(modem, VM_MODEM_RESULT_ERROR);
     vm_modem_reset_command(modem);
+    vm_modem_send_result(modem, VM_RC_OK);
+    return;
+
+send_error:
+    vm_modem_reset_command(modem);
+    vm_modem_send_result(modem, VM_RC_ERROR);
 }
 
 void vm_modem_init(VM_MODEM_CORE *modem)
@@ -881,6 +961,8 @@ void vm_modem_init(VM_MODEM_CORE *modem)
     modem->host_dtr_asserted = 1;
     modem->host_rts_asserted = 1;
     modem->raw_mode_enabled = 1;
+    modem->quiet_mode = 0;
+    modem->numeric_responses = 0;
     modem->next_session_id = 1;
     modem->current_session_id = 0;
     modem->s0_auto_answer_rings = 0UL;
@@ -997,7 +1079,7 @@ void vm_modem_set_helper_available(VM_MODEM_CORE *modem, int available)
              modem->state == VM_MODEM_STATE_CONNECTED_CMD)) {
             modem->current_session_id = 0;
             vm_modem_enter_helper_unavailable(modem);
-            vm_modem_queue_result(modem, VM_MODEM_RESULT_NO_CARRIER);
+            vm_modem_send_result(modem, VM_RC_NO_CARRIER);
         } else {
             vm_modem_enter_helper_unavailable(modem);
         }
@@ -1035,7 +1117,7 @@ void vm_modem_set_host_lines(VM_MODEM_CORE *modem,
          modem->state == VM_MODEM_STATE_RINGING ||
          modem->state == VM_MODEM_STATE_CONNECTED_DATA ||
          modem->state == VM_MODEM_STATE_CONNECTED_CMD)) {
-        vm_modem_terminate_session(modem, 1, VM_MODEM_RESULT_NO_CARRIER);
+        vm_modem_terminate_session(modem, 1, VM_RC_NO_CARRIER);
     }
 }
 
@@ -1050,7 +1132,7 @@ void vm_modem_poll(VM_MODEM_CORE *modem, unsigned long now_ms)
     if (modem->state == VM_MODEM_STATE_RINGING) {
         if (modem->ring_timeout_deadline_ms != 0 &&
             vm_modem_time_reached(now_ms, modem->ring_timeout_deadline_ms)) {
-            vm_modem_terminate_session(modem, 1, VM_MODEM_RESULT_NO_CARRIER);
+            vm_modem_terminate_session(modem, 1, VM_RC_NO_CARRIER);
             return;
         }
 
@@ -1074,7 +1156,7 @@ void vm_modem_poll(VM_MODEM_CORE *modem, unsigned long now_ms)
     if (modem->escape_post_guard_pending &&
         vm_modem_time_reached(now_ms, modem->escape_post_guard_deadline_ms)) {
         vm_modem_enter_connected_cmd(modem);
-        vm_modem_queue_result(modem, VM_MODEM_RESULT_OK);
+        vm_modem_send_result(modem, VM_RC_OK);
     }
 }
 
@@ -1263,7 +1345,7 @@ int vm_modem_on_connect_ok(VM_MODEM_CORE *modem,
     }
 
     vm_modem_enter_connected_data(modem, now_ms);
-    vm_modem_queue_result(modem, VM_MODEM_RESULT_CONNECT);
+    vm_modem_send_result(modem, VM_RC_CONNECT);
     return 1;
 }
 
@@ -1362,7 +1444,7 @@ int vm_modem_on_remote_closed(VM_MODEM_CORE *modem,
         return 0;
     }
 
-    vm_modem_terminate_session(modem, 0, VM_MODEM_RESULT_NO_CARRIER);
+    vm_modem_terminate_session(modem, 0, VM_RC_NO_CARRIER);
     return 1;
 }
 

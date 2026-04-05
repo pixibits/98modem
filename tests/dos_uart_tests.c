@@ -399,6 +399,248 @@ static void test_frontend_arbitration(void)
                0L);
 }
 
+static void test_uart_lsr_error_bits(void)
+{
+    VM_DOS_UART_STATE uart;
+    static const unsigned char byte = 0x41U;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+
+    /* Manually set parity, framing, and break error bits */
+    vm_dos_uart_enqueue_rx(&uart, &byte, 1U, 0);
+    uart.lsr |= VM_DOS_UART_LSR_PE | VM_DOS_UART_LSR_FE | VM_DOS_UART_LSR_BI;
+
+    expect_hex("lsr has all error bits",
+               vm_dos_uart_read(&uart, VM_DOS_UART_REG_LSR, 0) &
+               (VM_DOS_UART_LSR_OE | VM_DOS_UART_LSR_PE |
+                VM_DOS_UART_LSR_FE | VM_DOS_UART_LSR_BI),
+               VM_DOS_UART_LSR_PE | VM_DOS_UART_LSR_FE | VM_DOS_UART_LSR_BI);
+    /* All error bits clear on read */
+    expect_hex("lsr error bits clear on read",
+               vm_dos_uart_read(&uart, VM_DOS_UART_REG_LSR, 0) &
+               VM_DOS_UART_LSR_ERROR_MASK,
+               0x00U);
+}
+
+static void test_uart_line_status_interrupt(void)
+{
+    VM_DOS_UART_STATE uart;
+    static const unsigned char byte = 0x42U;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_OUT2,
+                      0);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IER,
+                      VM_DOS_UART_IER_LINE_STATUS |
+                      VM_DOS_UART_IER_RX_DATA |
+                      VM_DOS_UART_IER_THR_EMPTY,
+                      0);
+
+    /* Inject a byte and a parity error; write SCR to trigger recompute */
+    vm_dos_uart_enqueue_rx(&uart, &byte, 1U, 0);
+    uart.lsr |= VM_DOS_UART_LSR_PE;
+    vm_dos_uart_write(&uart, VM_DOS_UART_REG_SCR, 0U, 0);
+
+    expect_int("line status error is highest priority",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_LINE_STATUS);
+    expect_hex("iir reports line status",
+               vm_dos_uart_get_iir(&uart) & 0x0FU,
+               VM_DOS_UART_IIR_LINE_STATUS);
+    expect_int("irq asserted",
+               vm_dos_uart_get_irq_asserted(&uart),
+               1);
+
+    /* Reading LSR clears error bits -> priority drops to RX */
+    vm_dos_uart_read(&uart, VM_DOS_UART_REG_LSR, 0);
+    expect_int("after lsr read drops to rx data",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_RX_DATA);
+}
+
+static void test_uart_fcr_trigger_levels(void)
+{
+    VM_DOS_UART_STATE uart;
+    unsigned char buf[4];
+    unsigned short i;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_OUT2,
+                      0);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IER,
+                      VM_DOS_UART_IER_RX_DATA,
+                      0);
+
+    /* Set trigger level = 4 (FCR[7:6] = 01) */
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IIR_FCR,
+                      VM_DOS_UART_FCR_ENABLE | (1U << 6),
+                      0);
+    expect_int("threshold is 4",
+               (long)uart.rx_interrupt_threshold,
+               4L);
+
+    /* Enqueue 3 bytes: below threshold, no RX interrupt yet */
+    for (i = 0U; i < 3U; ++i) {
+        buf[i] = (unsigned char)('A' + i);
+    }
+    vm_dos_uart_enqueue_rx(&uart, buf, 3U, 0);
+    expect_int("no rx irq below threshold",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_NONE);
+
+    /* 4th byte crosses threshold */
+    buf[3] = 'D';
+    vm_dos_uart_enqueue_rx(&uart, buf + 3U, 1U, 0);
+    expect_int("rx irq fires at threshold",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_RX_DATA);
+}
+
+static void test_uart_fifo_timeout(void)
+{
+    VM_DOS_UART_STATE uart;
+    static const unsigned char byte = 0x55U;
+    unsigned short i;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_OUT2,
+                      0);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IER,
+                      VM_DOS_UART_IER_RX_DATA,
+                      0);
+    /* Threshold = 4, enqueue only 1 byte */
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IIR_FCR,
+                      VM_DOS_UART_FCR_ENABLE | (1U << 6),
+                      0);
+    vm_dos_uart_enqueue_rx(&uart, &byte, 1U, 0);
+    expect_int("no irq yet: below threshold",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_NONE);
+    expect_int("timeout armed",
+               uart.rx_timeout_armed,
+               1);
+
+    /* Tick 4 times to expire */
+    for (i = 0U; i < 4U; ++i) {
+        vm_dos_uart_tick(&uart, 0);
+    }
+    expect_int("fifo timeout interrupt fires",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_FIFO_TIMEOUT);
+    expect_hex("iir reports fifo timeout",
+               vm_dos_uart_get_iir(&uart) & 0x0FU,
+               VM_DOS_UART_IIR_FIFO_TIMEOUT);
+
+    /* Reading the byte should disarm timeout */
+    vm_dos_uart_read(&uart, VM_DOS_UART_REG_DATA, 0);
+    expect_int("timeout cleared after drain",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_NONE);
+    expect_int("rx_timeout_fired cleared",
+               uart.rx_timeout_fired,
+               0);
+}
+
+static void test_uart_loopback_tx_rx(void)
+{
+    VM_DOS_UART_STATE uart;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_IER,
+                      VM_DOS_UART_IER_RX_DATA,
+                      0);
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_OUT2 | VM_DOS_UART_MCR_LOOP,
+                      0);
+
+    vm_dos_uart_write(&uart, VM_DOS_UART_REG_DATA, 0xA5U, 0);
+    expect_int("byte appears in rx fifo",
+               (long)vm_dos_uart_get_rx_depth(&uart),
+               1L);
+    expect_int("tx fifo stays empty in loopback",
+               (long)vm_dos_uart_get_tx_depth(&uart),
+               0L);
+    expect_hex("rbr returns looped-back byte",
+               vm_dos_uart_read(&uart, VM_DOS_UART_REG_DATA, 0),
+               0xA5U);
+    expect_int("rx irq fires",
+               (long)vm_dos_uart_get_pending_irq(&uart),
+               (long)VMODEM_DOS_UART_IRQ_NONE); /* drained */
+}
+
+static void test_uart_loopback_msr_mirror(void)
+{
+    VM_DOS_UART_STATE uart;
+    unsigned char msr;
+
+    vm_dos_uart_init(&uart);
+    vm_dos_uart_configure(&uart, 0x3E8UL, 4UL, 1);
+
+    /* Enter loopback with DTR+RTS: maps to DSR+CTS.
+     * Reset already has MSR=CTS|DSR so no delta yet on this write. */
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_LOOP |
+                      VM_DOS_UART_MCR_DTR |
+                      VM_DOS_UART_MCR_RTS |
+                      VM_DOS_UART_MCR_OUT2,
+                      0);
+
+    msr = vm_dos_uart_read(&uart, VM_DOS_UART_REG_MSR, 0);
+    /* RTS->CTS, DTR->DSR, OUT2->RLSD should be reflected */
+    expect_hex("cts reflected from rts",
+               msr & VM_DOS_UART_MSR_CTS,
+               VM_DOS_UART_MSR_CTS);
+    expect_hex("dsr reflected from dtr",
+               msr & VM_DOS_UART_MSR_DSR,
+               VM_DOS_UART_MSR_DSR);
+    expect_hex("rlsd reflected from out2",
+               msr & VM_DOS_UART_MSR_RLSD,
+               VM_DOS_UART_MSR_RLSD);
+
+    /* Drop RTS: CTS should go low, producing DCTS delta */
+    vm_dos_uart_write(&uart,
+                      VM_DOS_UART_REG_MCR,
+                      VM_DOS_UART_MCR_LOOP |
+                      VM_DOS_UART_MCR_DTR |
+                      VM_DOS_UART_MCR_OUT2,
+                      0);
+    msr = vm_dos_uart_read(&uart, VM_DOS_UART_REG_MSR, 0);
+    expect_hex("cts low after rts drop",
+               msr & VM_DOS_UART_MSR_CTS,
+               0x00U);
+    expect_hex("dcts delta set",
+               msr & VM_DOS_UART_MSR_DCTS,
+               VM_DOS_UART_MSR_DCTS);
+    expect_hex("dsr still asserted",
+               msr & VM_DOS_UART_MSR_DSR,
+               VM_DOS_UART_MSR_DSR);
+
+    /* Deltas clear on next read */
+    msr = vm_dos_uart_read(&uart, VM_DOS_UART_REG_MSR, 0);
+    expect_hex("deltas clear on second read",
+               msr & (VM_DOS_UART_MSR_DCTS | VM_DOS_UART_MSR_DDSR),
+               0x00U);
+}
+
 int main(void)
 {
     test_uart_dlab();
@@ -407,6 +649,12 @@ int main(void)
     test_uart_interrupt_priority_and_out2();
     test_uart_msr_delta_clearing();
     test_frontend_arbitration();
+    test_uart_lsr_error_bits();
+    test_uart_line_status_interrupt();
+    test_uart_fcr_trigger_levels();
+    test_uart_fifo_timeout();
+    test_uart_loopback_tx_rx();
+    test_uart_loopback_msr_mirror();
 
     if (g_failures != 0) {
         fprintf(stderr, "%d dos_uart test(s) failed\n", g_failures);
